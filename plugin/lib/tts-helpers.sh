@@ -9,6 +9,29 @@ source "${PLUGIN_ROOT}/lib/state-dir.sh"
 
 PID_FILE="${GLADOS_STATE_DIR}/server.pid"
 
+# Python interpreter: prefer the plugin venv (system python3 may not exist)
+if [[ -x "${PLUGIN_ROOT}/tts/.venv/bin/python" ]]; then
+    PYTHON="${PLUGIN_ROOT}/tts/.venv/bin/python"
+else
+    PYTHON="python3"
+fi
+
+# Play a WAV file with the first available player
+play_audio() {
+    local file="$1"
+    if command -v afplay &>/dev/null; then
+        afplay "${file}"
+    elif command -v aplay &>/dev/null; then
+        aplay -q "${file}"
+    elif command -v pw-play &>/dev/null; then
+        pw-play "${file}"
+    elif command -v paplay &>/dev/null; then
+        paplay "${file}"
+    elif command -v ffplay &>/dev/null; then
+        ffplay -nodisp -autoexit -loglevel quiet "${file}"
+    fi
+}
+
 is_server_running() {
     # Check by PID file first
     if [[ -f "${PID_FILE}" ]]; then
@@ -39,7 +62,7 @@ wait_for_server() {
             return 0
         fi
         sleep 1
-        (( elapsed++ ))
+        elapsed=$((elapsed + 1))
     done
 
     echo "[GLaDOS TTS] Server failed to start within ${timeout}s" >&2

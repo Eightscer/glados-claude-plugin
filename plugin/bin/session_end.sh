@@ -10,7 +10,7 @@ source "${PLUGIN_ROOT}/lib/tts-helpers.sh"
 
 # Read hook input from stdin to get session_id
 INPUT=$(cat)
-SESSION_ID=$(echo "${INPUT}" | python3 -c "
+SESSION_ID=$(echo "${INPUT}" | "${PYTHON}" -c "
 import sys, json
 data = json.load(sys.stdin)
 print(data.get('session_id', ''))

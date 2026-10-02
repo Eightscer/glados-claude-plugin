@@ -7,7 +7,7 @@ set -euo pipefail
 PLUGIN_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 source "${PLUGIN_ROOT}/lib/tts-helpers.sh"
 
-SESSION_ID="${CORTEX_SESSION_ID:-${CLAUDE_SESSION_ID:-unknown}}"
+SESSION_ID="${CORTEX_SESSION_ID:-${CLAUDE_SESSION_ID:-${CLAUDE_CODE_SESSION_ID:-unknown}}}"
 SESSIONS_DIR="${GLADOS_STATE_DIR}/sessions"
 
 # Remove session registration and per-session mute

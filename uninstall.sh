@@ -6,6 +6,13 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PLUGIN_DIR="${SCRIPT_DIR}/plugin"
 TTS_DIR="${PLUGIN_DIR}/tts"
 
+# Prefer the plugin venv interpreter (system python3 may not exist)
+if [[ -x "${TTS_DIR}/.venv/bin/python" ]]; then
+    PYTHON="${TTS_DIR}/.venv/bin/python"
+else
+    PYTHON="python3"
+fi
+
 echo "GLaDOS TTS Plugin - Uninstall"
 echo ""
 
@@ -28,7 +35,7 @@ unregister_cortex_code() {
 
     # Remove hooks from settings.json
     if [[ -f "${settings_file}" ]]; then
-        python3 << MERGE_EOF
+        "${PYTHON}" << MERGE_EOF
 import json
 
 settings_file = "${settings_file}"
@@ -48,7 +55,7 @@ session_end_cmd = f"bash {plugin_dir}/bin/session_end.sh"
 session_start = hooks.get('SessionStart', [])
 new_session_start = [
     entry for entry in session_start
-    if not any(h.get('command', '') == serve_cmd for h in entry.get('hooks', []))
+    if not any(h.get('command', '').endswith(serve_cmd) for h in entry.get('hooks', []))
 ]
 if len(new_session_start) != len(session_start):
     modified = True
@@ -61,7 +68,7 @@ if len(new_session_start) != len(session_start):
 stop = hooks.get('Stop', [])
 new_stop = [
     entry for entry in stop
-    if not any(h.get('command', '') == speak_cmd for h in entry.get('hooks', []))
+    if not any(h.get('command', '').endswith(speak_cmd) for h in entry.get('hooks', []))
 ]
 if len(new_stop) != len(stop):
     modified = True
@@ -74,7 +81,7 @@ if len(new_stop) != len(stop):
 session_end = hooks.get('SessionEnd', [])
 new_session_end = [
     entry for entry in session_end
-    if not any(h.get('command', '') == session_end_cmd for h in entry.get('hooks', []))
+    if not any(h.get('command', '').endswith(session_end_cmd) for h in entry.get('hooks', []))
 ]
 if len(new_session_end) != len(session_end):
     modified = True
@@ -112,7 +119,7 @@ unregister_claude_code() {
         return 0
     fi
 
-    python3 << MERGE_EOF
+    "${PYTHON}" << MERGE_EOF
 import json
 
 settings_file = "${settings_file}"
@@ -132,7 +139,7 @@ session_end_cmd = f"bash {plugin_dir}/bin/session_end.sh"
 session_start = hooks.get('SessionStart', [])
 new_session_start = [
     entry for entry in session_start
-    if not any(h.get('command', '') == serve_cmd for h in entry.get('hooks', []))
+    if not any(h.get('command', '').endswith(serve_cmd) for h in entry.get('hooks', []))
 ]
 if len(new_session_start) != len(session_start):
     modified = True
@@ -145,7 +152,7 @@ if len(new_session_start) != len(session_start):
 stop = hooks.get('Stop', [])
 new_stop = [
     entry for entry in stop
-    if not any(h.get('command', '') == speak_cmd for h in entry.get('hooks', []))
+    if not any(h.get('command', '').endswith(speak_cmd) for h in entry.get('hooks', []))
 ]
 if len(new_stop) != len(stop):
     modified = True
@@ -158,7 +165,7 @@ if len(new_stop) != len(stop):
 session_end = hooks.get('SessionEnd', [])
 new_session_end = [
     entry for entry in session_end
-    if not any(h.get('command', '') == session_end_cmd for h in entry.get('hooks', []))
+    if not any(h.get('command', '').endswith(session_end_cmd) for h in entry.get('hooks', []))
 ]
 if len(new_session_end) != len(session_end):
     modified = True

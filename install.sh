@@ -68,289 +68,133 @@ download_model "${VOCODER_URL}" "${MODELS_DIR}/vocoder-gpu.pt" "HiFiGAN Vocoder 
 download_model "${EMB_URL}" "${MODELS_DIR}/emb/glados_p2.pt" "Speaker Embedding (glados_p2.pt)"
 download_model "${PHONEMIZER_URL}" "${MODELS_DIR}/en_us_cmudict_ipa_forward.pt" "Phonemizer Model (en_us_cmudict_ipa_forward.pt)"
 
-# --- State directory ---
+# --- State directories ---
 echo ""
-echo "[3/5] Creating runtime state directory..."
+echo "[3/5] Creating runtime state directories..."
 
-# Resolve GLADOS_STATE_DIR (same logic as plugin/lib/state-dir.sh)
-if [[ -n "${GLADOS_STATE_DIR:-}" ]]; then
-    :
-elif [[ -n "${CORTEX_SESSION_ID:-}" ]]; then
-    GLADOS_STATE_DIR="${HOME}/.snowflake/cortex/cache/glados"
-elif [[ -n "${CLAUDE_SESSION_ID:-}" ]]; then
-    GLADOS_STATE_DIR="${HOME}/.claude/cache/glados"
-else
-    GLADOS_STATE_DIR="${HOME}/.local/state/glados-tts"
+# Each platform gets a fixed state directory. It is passed explicitly to hooks
+# and commands as GLADOS_STATE_DIR, because hook processes don't inherit the
+# env vars state-dir.sh would otherwise use to detect the platform.
+CORTEX_STATE_DIR="${HOME}/.snowflake/cortex/cache/glados"
+CLAUDE_STATE_DIR="${HOME}/.claude/cache/glados"
+
+create_state_dir() {
+    mkdir -p "$1/sessions" "$1/audio"
+    echo "  ✓ State directory: $1"
+}
+
+create_state_dir "${CORTEX_STATE_DIR}"
+if [[ -d "$HOME/.claude" ]]; then
+    create_state_dir "${CLAUDE_STATE_DIR}"
 fi
-
-mkdir -p "${GLADOS_STATE_DIR}/sessions"
-mkdir -p "${GLADOS_STATE_DIR}/audio"
-echo "  ✓ State directory: ${GLADOS_STATE_DIR}"
 
 # --- Global registration ---
 echo ""
 echo "[4/5] Registering plugin globally..."
 
-register_cortex_code() {
-    local config_dir="$HOME/.snowflake/cortex"
+# register_platform <config_dir> <state_dir>
+register_platform() {
+    local config_dir="$1"
+    local state_dir="$2"
     local settings_file="${config_dir}/settings.json"
     local skills_dir="${config_dir}/skills/glados"
 
-    # Install skill files (substitute __PLUGIN_DIR__ placeholder with actual path)
+    # Install skill files (substitute placeholders with actual paths)
     mkdir -p "${skills_dir}"
     for skill_file in "${PLUGIN_DIR}/skills/glados/"*.md; do
-        sed "s|__PLUGIN_DIR__|${PLUGIN_DIR}|g" "${skill_file}" > "${skills_dir}/$(basename "${skill_file}")"
+        sed -e "s|__PLUGIN_DIR__|${PLUGIN_DIR}|g" -e "s|__STATE_DIR__|${state_dir}|g" \
+            "${skill_file}" > "${skills_dir}/$(basename "${skill_file}")"
     done
     echo "  ✓ GLaDOS skill installed to ${skills_dir}"
 
-    # Register hooks in settings.json (Stop + SessionEnd only; no SessionStart)
-    if [[ ! -f "${settings_file}" ]]; then
-        mkdir -p "${config_dir}"
-        cat > "${settings_file}" << SETTINGS_EOF
-{
-  "hooks": {
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash ${PLUGIN_DIR}/bin/speak.sh",
-            "timeout": 30
-          }
-        ]
-      }
-    ],
-    "SessionEnd": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash ${PLUGIN_DIR}/bin/session_end.sh",
-            "timeout": 10
-          }
-        ]
-      }
-    ]
-  }
-}
-SETTINGS_EOF
-        echo "  ✓ Created ${settings_file} with hooks"
-    else
-        python3 << MERGE_EOF
-import json, sys
+    # Register hooks in settings.json (Stop + SessionEnd only; no SessionStart).
+    # Existing GLaDOS hooks are matched by script path so older installs
+    # (without GLADOS_STATE_DIR) are replaced rather than duplicated.
+    "${VENV_DIR}/bin/python" - "${settings_file}" "${PLUGIN_DIR}" "${state_dir}" << 'MERGE_EOF'
+import json, os, sys
 
-settings_file = "${settings_file}"
-plugin_dir = "${PLUGIN_DIR}"
+settings_file, plugin_dir, state_dir = sys.argv[1:4]
 
-with open(settings_file, 'r') as f:
-    settings = json.load(f)
+settings = {}
+if os.path.exists(settings_file):
+    with open(settings_file, 'r') as f:
+        settings = json.load(f)
 
 hooks = settings.setdefault('hooks', {})
+
+def without(event, script):
+    suffix = f"bash {plugin_dir}/bin/{script}"
+    return [
+        entry for entry in hooks.get(event, [])
+        if not any(h.get('command', '').endswith(suffix) for h in entry.get('hooks', []))
+    ]
 
 # Remove old SessionStart hook if present (migration from previous install)
-serve_cmd = f"bash {plugin_dir}/bin/serve.sh"
-if 'SessionStart' in hooks:
-    hooks['SessionStart'] = [
-        entry for entry in hooks['SessionStart']
-        if not any(h.get('command', '') == serve_cmd for h in entry.get('hooks', []))
-    ]
-    if not hooks['SessionStart']:
-        del hooks['SessionStart']
+session_start = without('SessionStart', 'serve.sh')
+if session_start:
+    hooks['SessionStart'] = session_start
+else:
+    hooks.pop('SessionStart', None)
 
-# Stop hook
-speak_cmd = f"bash {plugin_dir}/bin/speak.sh"
-stop = hooks.get('Stop', [])
-already_has_speak = any(
-    h.get('command', '') == speak_cmd
-    for entry in stop
-    for h in entry.get('hooks', [])
-)
-if not already_has_speak:
-    stop.append({
-        "hooks": [{"type": "command", "command": speak_cmd, "timeout": 30}]
+for event, script, timeout in (('Stop', 'speak.sh', 30), ('SessionEnd', 'session_end.sh', 10)):
+    entries = without(event, script)
+    entries.append({
+        "hooks": [{
+            "type": "command",
+            "command": f'GLADOS_STATE_DIR="{state_dir}" bash {plugin_dir}/bin/{script}',
+            "timeout": timeout,
+        }]
     })
-    hooks['Stop'] = stop
+    hooks[event] = entries
 
-# SessionEnd hook
-session_end_cmd = f"bash {plugin_dir}/bin/session_end.sh"
-session_end = hooks.get('SessionEnd', [])
-already_has_end = any(
-    h.get('command', '') == session_end_cmd
-    for entry in session_end
-    for h in entry.get('hooks', [])
-)
-if not already_has_end:
-    session_end.append({
-        "hooks": [{"type": "command", "command": session_end_cmd, "timeout": 10}]
-    })
-    hooks['SessionEnd'] = session_end
-
+os.makedirs(os.path.dirname(settings_file), exist_ok=True)
 with open(settings_file, 'w') as f:
     json.dump(settings, f, indent=2)
     f.write('\n')
 
 print("  ✓ Hooks registered in " + settings_file)
 MERGE_EOF
-    fi
-}
-
-register_claude_code() {
-    local config_dir="$HOME/.claude"
-    local settings_file="${config_dir}/settings.json"
-    local skills_dir="${config_dir}/skills/glados"
-
-    if [[ ! -d "${config_dir}" ]]; then
-        echo "  - Claude Code not detected (no ~/.claude), skipping"
-        return 0
-    fi
-
-    # Install skill files
-    mkdir -p "${skills_dir}"
-    cp -f "${PLUGIN_DIR}/skills/glados/"*.md "${skills_dir}/"
-    echo "  ✓ GLaDOS skill installed to ${skills_dir}"
-
-    if [[ ! -f "${settings_file}" ]]; then
-        cat > "${settings_file}" << SETTINGS_EOF
-{
-  "hooks": {
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash ${PLUGIN_DIR}/bin/speak.sh",
-            "timeout": 30
-          }
-        ]
-      }
-    ],
-    "SessionEnd": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash ${PLUGIN_DIR}/bin/session_end.sh",
-            "timeout": 10
-          }
-        ]
-      }
-    ]
-  }
-}
-SETTINGS_EOF
-        echo "  ✓ Created ${settings_file} with hooks"
-    else
-        python3 << MERGE_EOF
-import json
-
-settings_file = "${settings_file}"
-plugin_dir = "${PLUGIN_DIR}"
-
-with open(settings_file, 'r') as f:
-    settings = json.load(f)
-
-hooks = settings.setdefault('hooks', {})
-
-# Remove old SessionStart hook if present (migration)
-serve_cmd = f"bash {plugin_dir}/bin/serve.sh"
-if 'SessionStart' in hooks:
-    hooks['SessionStart'] = [
-        entry for entry in hooks['SessionStart']
-        if not any(h.get('command', '') == serve_cmd for h in entry.get('hooks', []))
-    ]
-    if not hooks['SessionStart']:
-        del hooks['SessionStart']
-
-# Stop hook
-speak_cmd = f"bash {plugin_dir}/bin/speak.sh"
-stop = hooks.get('Stop', [])
-already_has_speak = any(
-    h.get('command', '') == speak_cmd
-    for entry in stop
-    for h in entry.get('hooks', [])
-)
-if not already_has_speak:
-    stop.append({
-        "hooks": [{"type": "command", "command": speak_cmd, "timeout": 30}]
-    })
-    hooks['Stop'] = stop
-
-# SessionEnd hook
-session_end_cmd = f"bash {plugin_dir}/bin/session_end.sh"
-session_end = hooks.get('SessionEnd', [])
-already_has_end = any(
-    h.get('command', '') == session_end_cmd
-    for entry in session_end
-    for h in entry.get('hooks', [])
-)
-if not already_has_end:
-    session_end.append({
-        "hooks": [{"type": "command", "command": session_end_cmd, "timeout": 10}]
-    })
-    hooks['SessionEnd'] = session_end
-
-with open(settings_file, 'w') as f:
-    json.dump(settings, f, indent=2)
-    f.write('\n')
-
-print("  ✓ Hooks registered in " + settings_file)
-MERGE_EOF
-    fi
 }
 
 echo "  Registering for Cortex Code..."
-register_cortex_code
+register_platform "$HOME/.snowflake/cortex" "${CORTEX_STATE_DIR}"
 
 echo "  Registering for Claude Code..."
-register_claude_code
+if [[ -d "$HOME/.claude" ]]; then
+    register_platform "$HOME/.claude" "${CLAUDE_STATE_DIR}"
+else
+    echo "  - Claude Code not detected (no ~/.claude), skipping"
+fi
 
 # --- Slash commands ---
 echo ""
 echo "[5/5] Installing slash commands..."
 
+# install_slash_commands <commands_dir> <state_dir> <label>
 install_slash_commands() {
     local commands_dir="$1"
-    local label="$2"
+    local state_dir="$2"
+    local label="$3"
+    local name
 
     mkdir -p "${commands_dir}"
 
-    cat > "${commands_dir}/glados_mute.md" << CMD_EOF
-Run this command: bash ${PLUGIN_DIR}/bin/glados_mute.sh
+    for name in glados_mute glados_unmute glados_mute_session glados_unmute_session \
+                glados_restart_server glados_off glados_off_all; do
+        cat > "${commands_dir}/${name}.md" << CMD_EOF
+Run this command: GLADOS_STATE_DIR="${state_dir}" bash ${PLUGIN_DIR}/bin/${name}.sh
 CMD_EOF
-
-    cat > "${commands_dir}/glados_unmute.md" << CMD_EOF
-Run this command: bash ${PLUGIN_DIR}/bin/glados_unmute.sh
-CMD_EOF
-
-    cat > "${commands_dir}/glados_mute_session.md" << CMD_EOF
-Run this command: bash ${PLUGIN_DIR}/bin/glados_mute_session.sh
-CMD_EOF
-
-    cat > "${commands_dir}/glados_unmute_session.md" << CMD_EOF
-Run this command: bash ${PLUGIN_DIR}/bin/glados_unmute_session.sh
-CMD_EOF
-
-    cat > "${commands_dir}/glados_restart_server.md" << CMD_EOF
-Run this command: bash ${PLUGIN_DIR}/bin/glados_restart_server.sh
-CMD_EOF
-
-    cat > "${commands_dir}/glados_off.md" << CMD_EOF
-Run this command: bash ${PLUGIN_DIR}/bin/glados_off.sh
-CMD_EOF
-
-    cat > "${commands_dir}/glados_off_all.md" << CMD_EOF
-Run this command: bash ${PLUGIN_DIR}/bin/glados_off_all.sh
-CMD_EOF
+    done
 
     echo "  ✓ ${label}: /glados_mute, /glados_unmute, /glados_mute_session, /glados_unmute_session, /glados_restart_server, /glados_off, /glados_off_all"
 }
 
 # Cortex Code commands
-install_slash_commands "$HOME/.snowflake/cortex/commands" "Cortex Code"
+install_slash_commands "$HOME/.snowflake/cortex/commands" "${CORTEX_STATE_DIR}" "Cortex Code"
 
 # Claude Code commands (if ~/.claude exists)
 if [[ -d "$HOME/.claude" ]]; then
-    install_slash_commands "$HOME/.claude/commands" "Claude Code"
+    install_slash_commands "$HOME/.claude/commands" "${CLAUDE_STATE_DIR}" "Claude Code"
 else
     echo "  - Claude Code not detected, skipping commands"
 fi

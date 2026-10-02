@@ -12,7 +12,7 @@ if [[ -n "${GLADOS_STATE_DIR:-}" ]]; then
     :
 elif [[ -n "${CORTEX_SESSION_ID:-}" ]]; then
     GLADOS_STATE_DIR="${HOME}/.snowflake/cortex/cache/glados"
-elif [[ -n "${CLAUDE_SESSION_ID:-}" ]]; then
+elif [[ -n "${CLAUDE_SESSION_ID:-}" || -n "${CLAUDE_CODE_SESSION_ID:-}" || -n "${CLAUDECODE:-}" ]]; then
     GLADOS_STATE_DIR="${HOME}/.claude/cache/glados"
 else
     GLADOS_STATE_DIR="${HOME}/.local/state/glados-tts"
