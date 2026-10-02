@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # speak.sh - Synthesize the latest response via GLaDOS TTS (Stop hook)
-# Reads the assistant's last response from the transcript, sends to TTS server,
+# Reads the assistant's last response from the hook input (or transcript), sends to TTS server,
 # and plays the resulting audio.
 
 set -euo pipefail
@@ -11,16 +11,11 @@ source "${PLUGIN_ROOT}/lib/tts-helpers.sh"
 # Read hook input from stdin
 INPUT=$(cat)
 
-# Extract transcript path and session_id from hook input
-read -r TRANSCRIPT_PATH SESSION_ID < <(echo "${INPUT}" | python3 -c "
+# Extract session_id from hook input
+SESSION_ID=$(echo "${INPUT}" | "${PYTHON}" -c "
 import sys, json
-data = json.load(sys.stdin)
-print(data.get('transcript_path', ''), data.get('session_id', ''))
-" 2>/dev/null || echo " ")
-
-if [[ -z "${TRANSCRIPT_PATH}" || ! -f "${TRANSCRIPT_PATH}" ]]; then
-    exit 0  # No transcript available, skip silently
-fi
+print(json.load(sys.stdin).get('session_id', ''))
+" 2>/dev/null || true)
 
 # Check if this session has opted in to GLaDOS TTS
 SESSIONS_DIR="${GLADOS_STATE_DIR}/sessions"
@@ -44,7 +39,7 @@ if [[ -f "${SESSIONS_DIR}/.muted-${SESSION_ID}" ]]; then
 fi
 
 # Extract the last assistant response text
-RESPONSE_TEXT=$("${PLUGIN_ROOT}/bin/extract-response.py" "${TRANSCRIPT_PATH}")
+RESPONSE_TEXT=$(echo "${INPUT}" | "${PYTHON}" "${PLUGIN_ROOT}/bin/extract-response.py" --hook-input)
 
 if [[ -z "${RESPONSE_TEXT}" ]]; then
     exit 0
@@ -53,72 +48,80 @@ fi
 # Fork synthesis + playback into background so the hook exits immediately
 # and the text response is shown to the user without delay.
 (
-    # Split text into sentence-bounded chunks (max ~900 chars each, within server's 1000 limit)
-    # and synthesize/play them sequentially so the full response is spoken.
-    CHUNKS=$(python3 -c "
-import sys, re, json
+    WORK_DIR=$(mktemp -d /tmp/glados-tts-XXXXXXXXXXXX)
+    trap 'rm -rf "${WORK_DIR}"' EXIT
+
+    # Split text into sentence-bounded chunks, one per line. The first chunk is
+    # kept short so playback starts quickly; later chunks are larger since they
+    # are synthesized while earlier ones play. Hard cap stays under the
+    # server's 1000-char limit.
+    "${PYTHON}" -c "
+import sys, re
 
 text = sys.argv[1]
-limit = 900
-chunks = []
+first_limit, limit, hard_limit = 200, 400, 900
 
-while text:
-    text = text.strip()
-    if not text:
-        break
-    if len(text) <= limit:
-        chunks.append(text)
-        break
-    # Find the last sentence boundary within the limit
-    window = text[:limit]
-    matches = list(re.finditer(r'[.!?](?:\s|$)', window))
-    if matches:
-        end = matches[-1].end()
-        chunks.append(window[:end].strip())
-        text = text[end:]
+sentences = []
+for s in re.split(r'(?<=[.!?])\s+', text):
+    s = s.strip()
+    # Break any oversized sentence at word boundaries
+    while len(s) > hard_limit:
+        cut = s.rfind(' ', 0, hard_limit)
+        if cut <= 0:
+            cut = hard_limit
+        sentences.append(s[:cut].strip())
+        s = s[cut:].strip()
+    if s:
+        sentences.append(s)
+
+chunks, current = [], ''
+for s in sentences:
+    cap = first_limit if not chunks else limit
+    if current and len(current) + 1 + len(s) > cap:
+        chunks.append(current)
+        current = s
     else:
-        # No sentence boundary; cut at last space
-        last_space = window.rfind(' ')
-        if last_space > 0:
-            chunks.append(window[:last_space].strip())
-            text = text[last_space:]
-        else:
-            chunks.append(window)
-            text = text[limit:]
+        current = f'{current} {s}' if current else s
+if current:
+    chunks.append(current)
 
-# Output as JSON array
-print(json.dumps(chunks))
-" "${RESPONSE_TEXT}")
+for c in chunks:
+    print(c)
+" "${RESPONSE_TEXT}" > "${WORK_DIR}/chunks"
 
-    # Play each chunk sequentially
-    echo "${CHUNKS}" | python3 -c "
-import sys, json
-chunks = json.load(sys.stdin)
-for chunk in chunks:
-    print(chunk)
-" | while IFS= read -r CHUNK; do
-        if [[ -z "${CHUNK}" ]]; then
-            continue
-        fi
+    TOTAL=$(wc -l < "${WORK_DIR}/chunks")
 
-        # URL-encode the chunk
-        ENCODED_TEXT=$(python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1]))" "${CHUNK}")
-
-        # Use a unique temp file
-        AUDIO_TMP=$(mktemp /tmp/glados-tts-XXXXXXXXXXXX) && mv "${AUDIO_TMP}" "${AUDIO_TMP}.wav" && AUDIO_TMP="${AUDIO_TMP}.wav"
-
-        HTTP_CODE=$(curl -s -o "${AUDIO_TMP}" -w "%{http_code}" \
-            "http://localhost:8124/synthesize/${ENCODED_TEXT}" 2>/dev/null || echo "000")
-
-        if [[ "${HTTP_CODE}" == "200" && -s "${AUDIO_TMP}" ]]; then
-            if command -v afplay &>/dev/null; then
-                afplay "${AUDIO_TMP}"
-            elif command -v aplay &>/dev/null; then
-                aplay "${AUDIO_TMP}"
+    # Producer: synthesize chunks in order. Each WAV is renamed into place only
+    # when complete; a .fail marker lets the player skip a failed chunk.
+    (
+        i=0
+        while IFS= read -r CHUNK; do
+            i=$((i + 1))
+            ENCODED_TEXT=$("${PYTHON}" -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1]))" "${CHUNK}")
+            HTTP_CODE=$(curl -s -o "${WORK_DIR}/${i}.part" -w "%{http_code}" \
+                "http://localhost:${TTS_PORT}/synthesize/${ENCODED_TEXT}" 2>/dev/null || echo "000")
+            if [[ "${HTTP_CODE}" == "200" && -s "${WORK_DIR}/${i}.part" ]]; then
+                mv "${WORK_DIR}/${i}.part" "${WORK_DIR}/${i}.wav"
+            else
+                touch "${WORK_DIR}/${i}.fail"
             fi
-        fi
-        rm -f "${AUDIO_TMP}"
+        done < "${WORK_DIR}/chunks"
+    ) &
+    PRODUCER_PID=$!
+
+    # Consumer: play each chunk as soon as it is ready, while later chunks synthesize
+    for ((i = 1; i <= TOTAL; i++)); do
+        while [[ ! -f "${WORK_DIR}/${i}.wav" && ! -f "${WORK_DIR}/${i}.fail" ]]; do
+            if ! kill -0 "${PRODUCER_PID}" 2>/dev/null; then
+                # Producer exited; re-check once in case it finished just now
+                [[ -f "${WORK_DIR}/${i}.wav" ]] || break 2
+            fi
+            sleep 0.1
+        done
+        [[ -f "${WORK_DIR}/${i}.wav" ]] && play_audio "${WORK_DIR}/${i}.wav"
     done
+
+    wait "${PRODUCER_PID}" 2>/dev/null || true
 ) &>/dev/null &
 disown
 

@@ -43,16 +43,18 @@ Detection uses `CORTEX_SESSION_ID` / `CLAUDE_SESSION_ID` env vars. The state dir
 - **Shared library sourcing**: All `plugin/bin/*.sh` scripts source `plugin/lib/tts-helpers.sh`, which in turn sources `plugin/lib/state-dir.sh`. This provides `$GLADOS_STATE_DIR`, `$PID_FILE`, `$PLUGIN_ROOT`, `is_server_running()`, and `wait_for_server()`.
 - **Mute hierarchy**: Global mute (`$GLADOS_STATE_DIR/.muted`) → session registration check → per-session mute (`sessions/.muted-<id>`).
 - **Async playback**: `speak.sh` forks synthesis+playback into `( ... ) &>/dev/null & disown` so the hook returns immediately and text displays without delay.
-- **Chunk splitting**: Responses over 900 chars are split at sentence boundaries before synthesis (server has 1000-char limit).
+- **Chunk splitting**: Responses are split at sentence boundaries into chunks (~200 chars for the first, ~400 after, 900 hard cap under the server's 1000-char limit). Chunks are synthesized ahead while earlier ones play.
+- **Inline code cues**: `extract-response.py` keeps backticks around inline code; `engine.py` replaces opening/closing backticks with `plugin/tts/sounds/ding_on.wav` / `ding_off.wav`. Fenced code blocks are dropped.
 
 ### Hook Flow
 
 ```
 Stop hook → speak.sh
-  → reads JSON from stdin (transcript_path, session_id)
+  → reads JSON from stdin (session_id, last_assistant_message, transcript_path)
   → checks session registered + not muted
-  → extract-response.py parses transcript
-  → chunks text → curls /synthesize/<text> → plays each WAV sequentially (in background)
+  → extract-response.py reads last_assistant_message from hook input
+    (falls back to parsing transcript; the transcript lags one message behind)
+  → chunks text → synthesizes chunks via /synthesize/<text> while playing finished ones in order (in background)
 
 SessionEnd hook → session_end.sh
   → removes session marker + per-session mute
@@ -72,7 +74,9 @@ Models live in `plugin/tts/models/` (gitignored, downloaded at install). The Pyt
 
 ### Install-time Substitution
 
-The skill's `SKILL.md` uses a `__PLUGIN_DIR__` placeholder that `install.sh` replaces with the absolute path via `sed` when copying to `~/.snowflake/cortex/skills/glados/` or `~/.claude/commands/`.
+The skill's `SKILL.md` uses `__PLUGIN_DIR__` and `__STATE_DIR__` placeholders that `install.sh` replaces with absolute paths via `sed` when copying to `~/.snowflake/cortex/skills/glados/` or `~/.claude/skills/glados/`.
+
+Hook processes don't inherit the env vars `state-dir.sh` uses for platform detection, so `install.sh` prefixes every hook, slash command, and the skill's activate command with an explicit `GLADOS_STATE_DIR="<platform state dir>"`. Existing GLaDOS hooks are matched by script-path suffix, so re-running the installer replaces them rather than duplicating them.
 
 ## Conventions
 

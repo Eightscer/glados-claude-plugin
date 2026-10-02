@@ -7,8 +7,10 @@ Adapted from R2D2FISH/glados-tts engine.py for plugin-local paths.
 import os
 import sys
 import hashlib
+import re
 import glob as glob_module
 from flask import Flask, send_file, abort
+from pydub import AudioSegment
 
 # Add plugin tts dir to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -42,13 +44,37 @@ glados = TTSRunner(models_dir=MODELS_DIR, log=True)
 print("[GLaDOS TTS] Engine ready on port 8124")
 
 
+def load_cue(name):
+    """Load a cue sound, converted to match run_tts output (22050 Hz, mono, 16-bit)."""
+    path = os.path.join(PLUGIN_TTS_DIR, "sounds", name)
+    return AudioSegment.from_wav(path).set_frame_rate(22050).set_channels(1).set_sample_width(2)
+
+
+# Played at opening and closing backticks of inline code
+CODE_OPEN = load_cue("ding_on.wav")
+CODE_CLOSE = load_cue("ding_off.wav")
+
+
+def synthesize_with_clicks(text, alpha=1.0):
+    """Synthesize text, marking inline code with opening/closing cue sounds."""
+    audio = AudioSegment.empty()
+    for i, segment in enumerate(text.split("`")):
+        if i > 0:
+            # Odd-numbered backticks open a code span, even-numbered close it
+            audio += CODE_OPEN if i % 2 == 1 else CODE_CLOSE
+        # Skip fragments with nothing pronounceable (e.g. lone punctuation)
+        if re.search(r"\w", segment):
+            audio += glados.run_tts(segment.strip(), alpha)
+    return audio
+
+
 def glados_tts(text, key=None, alpha=1.0):
     """Synthesize text and save to audio file. Returns output path."""
     if key is None:
         key = hashlib.sha256(text.encode()).hexdigest()[:16]
 
     output_file = os.path.join(AUDIO_DIR, f"GLaDOS-tts-{key}.wav")
-    glados.run_tts(text, alpha).export(output_file, format="wav")
+    synthesize_with_clicks(text, alpha).export(output_file, format="wav")
     return output_file
 
 

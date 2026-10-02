@@ -14,13 +14,22 @@ def strip_markdown(text):
     """Remove markdown formatting, code blocks, and special characters for cleaner TTS."""
     # Remove code blocks entirely
     text = re.sub(r'```[\s\S]*?```', '', text)
-    # Remove inline code
-    text = re.sub(r'`[^`]+`', '', text)
+    # Protect inline code from the markdown rules below (e.g. underscores in
+    # identifiers). Backticks are kept: the TTS server renders them as clicks.
+    code_spans = []
+
+    def stash_code(match):
+        code_spans.append(match.group(1))
+        return f'\x00{len(code_spans) - 1}\x00'
+
+    text = re.sub(r'`([^`\n]+)`', stash_code, text)
+    # Drop any stray unmatched backticks
+    text = text.replace('`', '')
     # Remove headers
     text = re.sub(r'^#{1,6}\s+', '', text, flags=re.MULTILINE)
     # Remove bold/italic markers
     text = re.sub(r'\*{1,3}([^*]+)\*{1,3}', r'\1', text)
-    text = re.sub(r'_{1,3}([^_]+)_{1,3}', r'\1', text)
+    text = re.sub(r'(?<!\w)_{1,3}([^_]+)_{1,3}(?!\w)', r'\1', text)  # not snake_case
     # Remove markdown tables (keep cell text, drop pipes and header separators)
     text = re.sub(r'^\|?[-:| ]+\|?$', '', text, flags=re.MULTILINE)  # header separator rows
     text = re.sub(r'\|', ' ', text)  # remaining pipes → spaces
@@ -31,9 +40,11 @@ def strip_markdown(text):
     # Remove numbered lists prefix
     text = re.sub(r'^\s*\d+\.\s+', '', text, flags=re.MULTILINE)
     # Collapse whitespace
-    text = re.sub(r'\n{2,}', '. ', text)
+    text = re.sub(r'([.!?:;])?\s*\n{2,}', lambda m: (m.group(1) or '.') + ' ', text)
     text = re.sub(r'\n', ' ', text)
     text = re.sub(r'\s{2,}', ' ', text)
+    # Restore inline code, still wrapped in backticks
+    text = re.sub(r'\x00(\d+)\x00', lambda m: f'`{code_spans[int(m.group(1))]}`', text)
     return text.strip()
 
 
@@ -99,10 +110,32 @@ def extract_last_response(transcript_path):
     return strip_markdown(last_assistant_text)
 
 
+def extract_from_hook_input(hook_input):
+    """Extract the response from Stop hook JSON.
+
+    Prefers last_assistant_message, which the hook receives before the final
+    message is flushed to the transcript; falls back to the transcript.
+    """
+    message = hook_input.get("last_assistant_message")
+    if isinstance(message, str) and message.strip():
+        return strip_markdown(message)
+
+    transcript_path = hook_input.get("transcript_path", "")
+    if transcript_path and os.path.isfile(transcript_path):
+        return extract_last_response(transcript_path)
+    return ""
+
+
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: extract-response.py <transcript_path>", file=sys.stderr)
+    if len(sys.argv) == 2 and sys.argv[1] == "--hook-input":
+        try:
+            result = extract_from_hook_input(json.load(sys.stdin))
+        except json.JSONDecodeError:
+            result = ""
+    elif len(sys.argv) == 2:
+        result = extract_last_response(sys.argv[1])
+    else:
+        print("Usage: extract-response.py <transcript_path> | --hook-input < hook.json", file=sys.stderr)
         sys.exit(1)
 
-    result = extract_last_response(sys.argv[1])
     print(result)

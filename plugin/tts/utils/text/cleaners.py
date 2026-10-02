@@ -21,14 +21,14 @@ _symbol_expansions = [
     ('#', ' hash '),
     ('%', ' percent '),
     ('*', ' star '),
-    ('/', ' slash '),
+    ('/', ' '),  # path separators: speak the parts, not the slashes
     ('\\', ' backslash '),
     ('~', ' tilde '),
     ('^', ' caret '),
     ('|', ' '),
     ('<', ' less than '),
     ('>', ' greater than '),
-    ('_', ' underscore '),
+    ('_', ' '),  # snake_case: speak the words, not the underscores
 ]
 
 # Custom pronunciation overrides (word -> phonetic spelling for the phonemizer)
@@ -78,8 +78,8 @@ def expand_symbols(text):
     # Context-aware hyphen/minus handling (order matters):
     # Triple+ dashes (---): remove entirely
     text = re.sub(r'-{3,}', ' ', text)
-    # Double dash flags: "--force" → "double dash force"
-    text = re.sub(r'(?<!\w)--(?=\w)', 'double dash ', text)
+    # Double dash flags: "--force" → "force"
+    text = re.sub(r'(?<!\w)--(?=\w)', ' ', text)
     # Single dash flags: "-f" → "dash f"
     text = re.sub(r'(?<!\w)-(?=\w)', 'dash ', text)
     # Math with spaces: "5 - 3", "x - y" → "minus"
@@ -90,6 +90,19 @@ def expand_symbols(text):
     text = re.sub(r'([A-Za-z])-([A-Za-z])', r'\1 \2', text)
     # Cleanup any remaining stray dashes
     text = re.sub(r'\s*-\s*', ' ', text)
+    return text
+
+
+def expand_file_extensions(text):
+    """Speak filename dots: "speak.sh" → "speak dot S H", ".gitignore" → "dot gitignore"."""
+    # Common Latin abbreviations would otherwise look like extensions
+    text = re.sub(r'\be\.g\.', 'for example', text, flags=re.IGNORECASE)
+    text = re.sub(r'\bi\.e\.', 'that is', text, flags=re.IGNORECASE)
+    # Extension after a name: spell out its letters (capitals phonemize as letter names)
+    text = re.sub(r'(?<=\w)\.([A-Za-z][A-Za-z0-9]{0,5})(?!\w)',
+                  lambda m: ' dot ' + ' '.join(m.group(1).upper()), text)
+    # Dotfile with no name before the dot: keep the word whole
+    text = re.sub(r'(?<![\w.])\.([A-Za-z]\w*)', r'dot \1', text)
     return text
 
 
@@ -116,6 +129,7 @@ def no_cleaners(text):
 
 def english_cleaners(text):
     text = unidecode(text)
+    text = expand_file_extensions(text)
     text = normalize_numbers(text)
     text = expand_abbreviations(text)
     text = expand_symbols(text)
